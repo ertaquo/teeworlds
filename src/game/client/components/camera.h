@@ -37,7 +37,7 @@ public:
 	virtual void OnConsoleInit();
 	virtual void OnStateChange(int NewState, int OldState);
 
-private:
+public:
 	enum
 	{
 		CAMTYPE_UNDEFINED=-1,

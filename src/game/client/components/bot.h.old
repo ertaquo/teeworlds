@@ -1,0 +1,149 @@
+#ifndef GAME_CLIENT_COMPONENTS_BOT_H
+#define GAME_CLIENT_COMPONENTS_BOT_H
+
+#include <base/vmath.h>
+#include <game/client/component.h>
+
+#include <vector>
+
+struct CBotEntity
+{
+	public:
+		ivec2 m_FieldPosition;
+		vec2 m_Position;
+		int m_Type;
+    bool m_Need;
+    bool m_Active;
+    int m_JPSLength;
+};
+
+struct CJPSCache
+{
+  public:
+    bool m_Fat;
+    bool m_Danger;
+    ivec2 m_From;
+    ivec2 m_To;
+    bool m_Found;
+    std::vector<ivec2> m_Path;
+};
+
+struct CTriangle {
+  public:
+    vec2 m_A;
+    vec2 m_B;
+    vec2 m_C;
+
+    // for private purposes
+    int m_iA;
+    int m_iB;
+    int m_iC;
+
+    // triangle center. not circumcenter!
+    vec2 m_Center;
+
+    std::vector<CTriangle*> m_aNeighbours;
+};
+
+struct CTrianglePathCache
+{
+  public:
+    CTriangle * m_pFrom;
+    CTriangle * m_pTo;
+    std::vector<vec2> m_Path;
+    char * m_pField;
+};
+
+enum {
+  ENTITY_BOT_EXTENDED = NUM_ENTITIES,
+  ENTITY_FLAG_RED,
+  ENTITY_FLAG_BLUE,
+  ENTITY_ENEMY
+};
+
+class CBot : public CComponent
+{
+private:
+	char * m_pField;
+  char * m_pFatField;
+  char * m_pDangerField;
+  char * m_pDangerFatField;
+	int m_Width;
+	int m_Height;
+
+	inline int GetFieldIndex(int x, int y) { return x + y * m_Width; };
+	ivec2 GetPositionFromIndex(int index) { return ivec2(index % m_Width, index / m_Width); }
+
+	ivec2 m_FieldMoveTargetPos;
+	vec2 m_MoveTargetPos;
+  bool m_IsMoveTargetRandom;
+
+  std::vector<CJPSCache> m_aJPSCache;
+  CJPSCache FindJPSCache(ivec2 From, ivec2 To, bool Fat = true, bool Danger = true);
+
+	std::vector<ivec2> m_aJPSPath;
+	void ComputeJPSPath(bool Fat = true, bool Danger = true);
+	void RenderJPSPath();
+	int GetJPSLength(ivec2 From, ivec2 To, bool Fat = true, bool Danger = true);
+
+	void Predict(CNetObj_Character * pCharacter, CNetObj_PlayerInput Input, int Tick);
+  CNetObj_Character * IntersectEnemies(vec2 Pos0, vec2 Pos1, float Radius, vec2& NewPos);
+  bool IntersectCharacter(CNetObj_Character Character, vec2 Pos0, vec2 Pos1, float Radius);
+
+	CNetObj_PlayerInput ComputeAStar(const int GenerationsCount = 2, const int PredictionTicks = 8);
+
+
+  std::vector<vec2> m_aTrianglesPath;
+  std::vector<CTrianglePathCache> m_aTrianglesPathCache;
+  CTrianglePathCache ComputeTrianglesPath(CTriangle * pFrom, CTriangle * pTo);
+  CTrianglePathCache ComputeTrianglesPath();
+  float ComputeTrianglesPathLength(vec2 From, vec2 To);
+  char * GetTrianglesPathField();
+
+
+  std::vector<vec2> m_aCorners;
+  std::vector<CTriangle *> m_aTriangles;
+  CTriangle * AddTriangle(vec2 a, vec2 b, vec2 c, int ia, int ib, int ic);
+  bool PointInTriangle(vec2 a, vec2 b, vec2 c, vec2 p);
+
+  CTriangle * FindTriangle(vec2 p);
+
+  bool TrianglesEqual(CTriangle * t1, CTriangle * t2);
+  bool TrianglesNearby(CTriangle * t1, CTriangle * t2);
+
+  void ComputeTriangles();
+  void RenderTriangles();
+
+	void LoadMapData();
+  void UpdateDangerFields();
+
+
+  int m_aWeapons[NUM_WEAPONS];
+  void ResetWeapons();
+
+	std::vector<CBotEntity> m_aEntities;
+
+  void UpdateSnapData();
+  void UpdateEntities(bool Active = true);
+  bool IsFlagholder();
+  CBotEntity * FindEntityByType(int Type);
+	void ChooseNewMoveTarget();
+
+  bool IsEnemy(int ClientId);
+  CNetObj_PlayerInput Shoot(CNetObj_PlayerInput Input);
+
+  CNetObj_PlayerInput m_PrevInput;
+public:
+	CBot();
+
+	virtual void OnReset();
+	virtual void OnRelease();
+	virtual void OnRender();
+	virtual void OnMessage(int MsgType, void * pRawMsg);
+	virtual void OnPlayerDeath();
+	virtual void OnStartGame();
+
+	CNetObj_PlayerInput GetInputData();
+};
+
+#endif

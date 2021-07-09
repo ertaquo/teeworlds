@@ -1,0 +1,1876 @@
+#include <base/math.h>
+
+#include <engine/shared/config.h>
+
+#include <game/collision.h>
+#include <game/mapitems.h>
+#include <game/client/gameclient.h>
+#include <game/client/component.h>
+
+#include <engine/external/astar-jps/AStar.h>
+#include <engine/graphics.h>
+
+#include "bot.h"
+#include "camera.h"
+
+#include <stdio.h>
+#include <algorithm>
+
+static IGraphics::CTextureHandle gs_EmptyTexture;
+
+// --- A* ---
+
+void CBot::Predict(CNetObj_Character * pCharacter, CNetObj_PlayerInput Input, int Tick)
+{
+	CWorldCore TempWorld;
+  TempWorld.m_Tuning = m_pClient->m_Tuning;
+
+	CCharacterCore TempCore;
+	mem_zero(&TempCore, sizeof(TempCore));
+	TempCore.Init(&TempWorld, Collision());
+	TempCore.Read(pCharacter);
+  TempCore.m_Input = Input;
+
+  TempWorld.m_apCharacters[0] = &TempCore;
+
+  for (int i = 0; i < Tick; i++)
+	{
+		pCharacter->m_Tick++;
+		TempCore.Tick(true);
+		TempCore.Move();
+		TempCore.Quantize();
+	}
+
+	TempCore.Write(pCharacter);
+}
+
+CNetObj_Character * CBot::IntersectEnemies(vec2 Pos0, vec2 Pos1, float Radius, vec2& NewPos)
+{
+	float ClosestLen = distance(Pos0, Pos1) * 100.0f;
+  CNetObj_Character * pClosest = NULL;
+
+  for (int ClientId = 0; ClientId < MAX_CLIENTS; ClientId++) {
+    if (!IsEnemy(ClientId))
+      continue;
+
+    CNetObj_Character Character = m_pClient->m_Snap.m_aCharacters[ClientId].m_Cur;
+    vec2 ClientPos(Character.m_X, Character.m_Y);
+
+    if (distance(ClientPos, vec2(0, 0)) < 16.0f)
+      continue;
+
+		vec2 IntersectPos = closest_point_on_line(Pos0, Pos1, ClientPos);
+		float Len = distance(ClientPos, IntersectPos);
+		if(Len < 28.0f + Radius)
+		{
+			Len = distance(Pos0, IntersectPos);
+			if(Len < ClosestLen)
+			{
+				NewPos = IntersectPos;
+				ClosestLen = Len;
+				pClosest = &m_pClient->m_Snap.m_aCharacters[ClientId].m_Cur;
+			}
+		}
+	}
+
+	return pClosest;
+}
+
+bool CBot::IntersectCharacter(CNetObj_Character Character, vec2 Pos0, vec2 Pos1, float Radius)
+{
+  vec2 ClientPos(Character.m_X, Character.m_Y);
+  vec2 IntersectPos = closest_point_on_line(Pos0, Pos1, ClientPos);
+  float Len = distance(ClientPos, IntersectPos);
+  return Len < 28.0f + Radius;
+}
+
+struct AStarNode
+{
+	public:
+		bool m_Open;
+
+		CNetObj_Character m_Character;
+		CNetObj_PlayerInput m_InputData;
+    int m_RealJPSLength;
+		int m_JPSLength;
+		int m_Generation;
+		float m_Distance;
+
+    float m_TrianglesPathLength;
+
+		AStarNode * m_pPrev;
+};
+
+CNetObj_PlayerInput CBot::ComputeAStar(const int GenerationsCount, const int PredictionTicks)
+{
+	if (!m_pClient->m_Snap.m_pLocalCharacter)
+		return {0};
+
+  m_aJPSCache.clear();
+
+	//std::vector<AStarNode *> aNodes;
+  AStarNode * aNodes[65536] = {0};
+  int aNodesCount = 0;
+
+	AStarNode * pFirst = (AStarNode *)mem_alloc(sizeof(AStarNode), 1);
+	pFirst->m_Open = true;
+	mem_copy(&pFirst->m_Character, m_pClient->m_Snap.m_pLocalCharacter, sizeof(CNetObj_Character));
+	mem_copy(&pFirst->m_InputData, &m_PrevInput, sizeof(CNetObj_PlayerInput));
+
+  pFirst->m_TrianglesPathLength = ComputeTrianglesPathLength(vec2(pFirst->m_Character.m_X, pFirst->m_Character.m_Y), m_MoveTargetPos);
+	pFirst->m_JPSLength = GetJPSLength(ivec2((int)round(pFirst->m_Character.m_X / 32.0f), (int)round(pFirst->m_Character.m_Y / 32.0f)), m_FieldMoveTargetPos);
+  pFirst->m_RealJPSLength = pFirst->m_JPSLength;
+	pFirst->m_pPrev = NULL;
+	pFirst->m_Generation = 0;
+	pFirst->m_Distance = distance(vec2(pFirst->m_Character.m_X, pFirst->m_Character.m_Y), m_MoveTargetPos);
+	//aNodes.push_back(pFirst);
+  aNodes[aNodesCount++] = pFirst;
+
+	int CurrGeneration = 0;
+  while(CurrGeneration < GenerationsCount)
+	{
+		AStarNode * pNode = NULL;
+		for (int i = 0; i < aNodesCount; i++)
+		{
+			if (!aNodes[i]->m_Open || aNodes[i]->m_Generation != CurrGeneration)
+				continue;
+
+			if (!pNode || (pNode->m_JPSLength > aNodes[i]->m_JPSLength) || (pNode->m_JPSLength == aNodes[i]->m_JPSLength && pNode->m_Distance > aNodes[i]->m_Distance))
+				pNode = aNodes[i];
+		}
+
+		if (!pNode)
+		{
+			CurrGeneration++;
+			continue;
+		}
+
+//		if (pNode->m_JPSLength == 0)
+//			break;
+
+		pNode->m_Open = false;
+
+		for (int dir = -1; dir <= 1; dir++)
+		{
+			for (int jump = 0; jump <= 1; jump++)
+			{
+				for (int hook = 0; hook <= 3; hook++)
+				{
+					AStarNode * pNewNode = (AStarNode *)mem_alloc(sizeof(AStarNode), 1);
+					pNewNode->m_Open = true;
+					pNewNode->m_Generation = pNode->m_Generation + 1;
+					mem_copy(&pNewNode->m_Character, &pNode->m_Character, sizeof(CNetObj_Character));
+					mem_zero(&pNewNode->m_InputData, sizeof(CNetObj_PlayerInput));
+					pNewNode->m_pPrev = pNode;
+
+					pNewNode->m_InputData.m_Direction = dir;
+					pNewNode->m_InputData.m_Jump = jump;
+					pNewNode->m_InputData.m_Hook = hook;
+          pNewNode->m_InputData.m_TargetX = pNode->m_InputData.m_TargetX;
+          pNewNode->m_InputData.m_TargetY = pNode->m_InputData.m_TargetY;
+
+          if (hook > 1) {
+            pNewNode->m_InputData.m_TargetX = (rand()%100 - rand()%100);
+            pNewNode->m_InputData.m_TargetY = (rand()%100 - rand()%100);
+          }
+
+          /*if (hook == 1) {
+            pNewNode->m_InputData.m_TargetX = -100;
+            pNewNode->m_InputData.m_TargetY = -100;
+          }
+          if (hook == 2) {
+            pNewNode->m_InputData.m_TargetX = 100;
+            pNewNode->m_InputData.m_TargetY = -100;
+          }*/
+
+					Predict(&pNewNode->m_Character, pNewNode->m_InputData, PredictionTicks);
+
+          vec2 Pos(pNewNode->m_Character.m_X, pNewNode->m_Character.m_Y);
+          ivec2 iPos((int)round(Pos.x / 32.0f), (int)round(Pos.y / 32.0f));
+
+          //pNewNode->m_TrianglesPathLength = ComputeTrianglesPathLength(Pos, m_MoveTargetPos);
+
+					pNewNode->m_JPSLength = GetJPSLength(iPos, m_FieldMoveTargetPos);
+          pNewNode->m_RealJPSLength = pNewNode->m_JPSLength;
+					pNewNode->m_Distance = distance(Pos, m_MoveTargetPos);
+
+          //if (pNewNode->m_TrianglesPathLength < pNode->m_TrianglesPathLength)
+          //  pNewNode->m_JPSLength -= 5;
+
+          //pNewNode->m_JPSLength = pNewNode->m_TrianglesPathLength;
+
+          if (iPos.x >= 0 && iPos.y >= 0 && iPos.x < m_Width && iPos.y < m_Height) {
+            if (!m_pDangerField[GetFieldIndex(iPos.x, iPos.y)])
+              pNewNode->m_JPSLength++;
+            if (!m_pDangerFatField[GetFieldIndex(iPos.x, iPos.y)])
+              pNewNode->m_JPSLength++;
+          }
+
+          if (jump == 0)
+            pNewNode->m_JPSLength--;
+          if (hook == 0)
+            pNewNode->m_JPSLength -= 2;
+
+					aNodes[aNodesCount++] = pNewNode;
+				}
+			}
+		}
+	}
+
+	CNetObj_PlayerInput InputData = {0};
+	AStarNode * pNode = NULL;
+	for (int i = 0; i < aNodesCount; i++)
+	{
+		if (!aNodes[i]->m_Open || aNodes[i]->m_RealJPSLength == pFirst->m_RealJPSLength)
+			continue;
+
+		if (!pNode || (pNode->m_JPSLength > aNodes[i]->m_JPSLength) || (pNode->m_JPSLength == aNodes[i]->m_JPSLength && pNode->m_Distance > aNodes[i]->m_Distance))
+			pNode = aNodes[i];
+	}
+
+  if (!pNode) {
+    for (int i = 0; i < aNodesCount; i++)
+    {
+      if (!aNodes[i]->m_Open)
+        continue;
+
+      if (!pNode || (pNode->m_JPSLength > aNodes[i]->m_JPSLength) || (pNode->m_JPSLength == aNodes[i]->m_JPSLength && pNode->m_Distance > aNodes[i]->m_Distance))
+        pNode = aNodes[i];
+    }
+  }
+
+	int jps = pNode->m_JPSLength;
+
+	while (pNode->m_pPrev && pNode->m_Generation != 1)
+  {
+		pNode = pNode->m_pPrev;
+  }
+
+	mem_copy(&InputData, &pNode->m_InputData, sizeof(CNetObj_PlayerInput));
+
+	for (int i = 0; i < aNodesCount; i++)
+		mem_free(aNodes[i]);
+	//aNodes.clear();
+
+	return InputData;
+}
+
+// --- /A* ---
+
+CBot::CBot()
+{
+	m_pField = NULL;
+	m_pFatField = NULL;
+  m_pDangerField = NULL;
+  m_pDangerFatField = NULL;
+	m_Width = 0;
+	m_Height = 0;
+  ResetWeapons();
+}
+
+void CBot::OnReset()
+{
+	if (m_pField)
+		mem_free(m_pField);
+	if (m_pFatField)
+		mem_free(m_pFatField);
+	if (m_pDangerField)
+		mem_free(m_pDangerField);
+	if (m_pDangerFatField)
+		mem_free(m_pDangerFatField);
+
+	m_pField = NULL;
+	m_pFatField = NULL;
+  m_pDangerField = NULL;
+  m_pDangerFatField = NULL;
+	m_Width = 0;
+	m_Height = 0;
+	m_aEntities.clear();
+	m_aJPSPath.clear();
+  m_aCorners.clear();
+
+  if (!m_aTriangles.empty()) {
+    for (int i = 0; i < m_aTriangles.size(); i++) {
+      delete m_aTriangles[i];
+    }
+  }
+  m_aTriangles.clear();
+  m_aTrianglesPath.clear();
+  m_aTrianglesPathCache.clear();
+}
+
+void CBot::OnRelease()
+{
+	OnReset();
+}
+
+void CBot::OnRender()
+{
+  if (!Config()->m_ClBot)
+    return;
+
+	if(Client()->State() != IClient::STATE_ONLINE)
+		return;
+
+  auto pCharacter = m_pClient->m_Snap.m_pLocalCharacter;
+  if (pCharacter && pCharacter->m_Weapon != WEAPON_HAMMER) {
+    m_aWeapons[pCharacter->m_Weapon] = pCharacter->m_AmmoCount;
+  }
+
+	if (m_aEntities.empty())
+		LoadMapData();
+
+	ComputeJPSPath();
+	RenderJPSPath();
+
+  //RenderTriangles();
+
+  ChooseNewMoveTarget();
+}
+
+void CBot::OnMessage(int MsgType, void * pRawMsg)
+{
+	if(MsgType == NETMSGTYPE_SV_WEAPONPICKUP)
+	{
+		CNetMsg_Sv_WeaponPickup *pMsg = (CNetMsg_Sv_WeaponPickup *)pRawMsg;
+    m_aWeapons[pMsg->m_Weapon] = 10;
+	}
+}
+
+void CBot::OnPlayerDeath()
+{
+  ResetWeapons();
+}
+
+void CBot::OnStartGame()
+{
+  ResetWeapons();
+}
+
+void CBot::ResetWeapons()
+{
+  m_aWeapons[WEAPON_HAMMER] = -1;
+  m_aWeapons[WEAPON_GUN] = 10;
+  m_aWeapons[WEAPON_SHOTGUN] = 0;
+  m_aWeapons[WEAPON_GRENADE] = 0;
+  m_aWeapons[WEAPON_LASER] = 0;
+  m_aWeapons[WEAPON_NINJA] = 0;
+}
+
+CJPSCache CBot::FindJPSCache(ivec2 From, ivec2 To, bool Fat, bool Danger)
+{
+  /*
+  for (int i = 0; i < m_aJPSCache.size(); i++)
+  {
+    CJPSCache & Cache = m_aJPSCache[i];
+    if (Cache.m_From == From && Cache.m_To == To)
+      return Cache;
+  }
+
+  CJPSCache Cache;
+  Cache.m_From = From;
+  Cache.m_To = To;
+  Cache.m_Path.clear();
+
+	int Begin = GetFieldIndex(From.x, From.y);
+	int End = GetFieldIndex(To.x, To.y);
+
+  char * pField = GetTrianglesPathField();
+  if (!pField)
+    return Cache;
+
+  pField[Begin] = 1;
+  pField[End] = 1;
+
+	int SolutionLength = 0;
+	int * pSolution = astar_compute((const char *)pField, &SolutionLength, m_Width, m_Height, Begin, End);
+
+	if (pSolution) {
+    if (SolutionLength > 0)
+    {
+      for (int i = 0; i < SolutionLength; i++)
+      {
+        Cache.m_Path.push_back(GetPositionFromIndex(pSolution[i]));
+      }
+    }
+		free(pSolution);
+  }
+
+  m_aJPSCache.push_back(Cache);
+  return Cache;*/
+
+  
+
+  for (int i = 0; i < m_aJPSCache.size(); i++)
+  {
+    CJPSCache & Cache = m_aJPSCache[i];
+    if (Cache.m_From == From && Cache.m_To == To && Cache.m_Fat == Fat && Cache.m_Danger == Danger)
+      return Cache;
+  }
+
+  CJPSCache Cache;
+  Cache.m_From = From;
+  Cache.m_To = To;
+  Cache.m_Fat = Fat;
+  Cache.m_Danger = Danger;
+  Cache.m_Path.clear();
+
+	int Begin = GetFieldIndex(From.x, From.y);
+	int End = GetFieldIndex(To.x, To.y);
+
+  char * pField = Danger ? (Fat ? m_pDangerFatField : m_pDangerField) : (Fat ? m_pFatField : m_pField);
+
+  char savedBegin = pField[Begin];
+  char savedEnd = pField[End];
+
+  pField[Begin] = 1;
+  pField[End] = 1;
+
+	int SolutionLength = 0;
+	int * pSolution = astar_compute((const char *)pField, &SolutionLength, m_Width, m_Height, Begin, End);
+
+	if (pSolution) {
+    if (SolutionLength > 0)
+    {
+      for (int i = 0; i < SolutionLength; i++)
+      {
+        Cache.m_Path.push_back(GetPositionFromIndex(pSolution[i]));
+      }
+    }
+		free(pSolution);
+  }
+
+  pField[Begin] = savedBegin;
+  pField[End] = savedEnd;
+
+  m_aJPSCache.push_back(Cache);
+  return Cache;
+  
+}
+
+void CBot::ComputeJPSPath(bool Fat, bool Danger)
+{
+	m_aJPSPath.clear();
+
+	const CNetObj_Character * pPlayerChar = m_pClient->m_Snap.m_pLocalCharacter;
+	const CNetObj_Character * pPrevChar = m_pClient->m_Snap.m_pLocalPrevCharacter;
+
+	if (!m_pField || !pPlayerChar || !pPrevChar)
+		return;
+
+	vec2 LocalPosition = mix(vec2(pPrevChar->m_X, pPrevChar->m_Y), vec2(pPlayerChar->m_X, pPlayerChar->m_Y), Client()->IntraGameTick());
+  ivec2 FieldPosition = ivec2((int)round(LocalPosition.x / 32), (int)round(LocalPosition.y / 32));
+
+  CJPSCache Cache = FindJPSCache(FieldPosition, m_FieldMoveTargetPos, Fat, Danger);
+  if (Cache.m_Path.size() == 0 && Fat && Danger) {
+    Cache = FindJPSCache(FieldPosition, m_FieldMoveTargetPos, false, true);
+    Fat = false;
+  }
+  /*if (Cache.m_Path.size() == 0 && !Fat && Danger) {
+    Cache = FindJPSCache(FieldPosition, m_FieldMoveTargetPos, true, false);
+    Fat = true;
+    Danger = false;
+  }
+  if (Cache.m_Path.size() == 0 && Fat && !Danger) {
+    Cache = FindJPSCache(FieldPosition, m_FieldMoveTargetPos, false, false);
+    Fat = false;
+  }*/
+
+  m_aJPSPath = Cache.m_Path;
+}
+
+int CBot::GetJPSLength(ivec2 From, ivec2 To, bool Fat, bool Danger)
+{
+	if (!m_pField)
+		return 0;
+
+  CJPSCache Cache = FindJPSCache(From, To, Fat, Danger);
+  if (Cache.m_Path.size() == 0 && Fat && Danger) {
+    Cache = FindJPSCache(From, To, false, true);
+    Fat = false;
+  }
+  /*if (Cache.m_Path.size() == 0 && Fat && Danger) {
+    Cache = FindJPSCache(From, To, true, false);
+    Fat = true;
+    Danger = false;
+  }
+  if (Cache.m_Path.size() == 0 && Fat && !Danger) {
+    Cache = FindJPSCache(From, To, false, false);
+    Fat = false;
+  }*/
+
+	return Cache.m_Path.size();
+}
+
+void CBot::RenderJPSPath()
+{
+	CUIRect Screen;
+	Graphics()->GetScreen(&Screen.x, &Screen.y, &Screen.w, &Screen.h);
+
+	vec2 Center = m_pClient->m_pCamera->m_Center;
+
+	CMapItemGroup * pGroup = Layers()->GameGroup();
+
+	float Points[4];
+	RenderTools()->MapScreenToWorld(Center.x, Center.y, pGroup->m_ParallaxX/100.0f, pGroup->m_ParallaxY/100.0f,
+		pGroup->m_OffsetX, pGroup->m_OffsetY, Graphics()->ScreenAspect(), 1.0f, Points);
+	Graphics()->MapScreen(Points[0], Points[1], Points[2], Points[3]);
+
+	Graphics()->BlendNormal();
+	Graphics()->TextureSet(gs_EmptyTexture);
+	Graphics()->QuadsBegin();
+	for (int i = 0; i < m_aJPSPath.size(); i++)
+	{
+		float q = 1.0f - ((float)i / (float)m_aJPSPath.size());
+		Graphics()->SetColor(q, q, q, 0.7f);
+
+		ivec2 Pos = m_aJPSPath[i];
+
+		IGraphics::CQuadItem QuadItem(Pos.x * 32, Pos.y * 32, 32, 32);
+		Graphics()->QuadsDrawTL(&QuadItem, 1);
+	}
+	Graphics()->QuadsEnd();
+}
+
+void CBot::RenderTriangles() {
+	CUIRect Screen;
+	Graphics()->GetScreen(&Screen.x, &Screen.y, &Screen.w, &Screen.h);
+
+	vec2 Center = m_pClient->m_pCamera->m_Center;
+
+	CMapItemGroup * pGroup = Layers()->GameGroup();
+
+	float Points[4];
+	RenderTools()->MapScreenToWorld(Center.x, Center.y, pGroup->m_ParallaxX/100.0f, pGroup->m_ParallaxY/100.0f,
+		pGroup->m_OffsetX, pGroup->m_OffsetY, Graphics()->ScreenAspect(), 1.0f, Points);
+	Graphics()->MapScreen(Points[0], Points[1], Points[2], Points[3]);
+
+	Graphics()->BlendNormal();
+	Graphics()->TextureSet(gs_EmptyTexture);
+	Graphics()->QuadsBegin();
+
+  for (int i = 0; i < m_aCorners.size(); i++) {
+    float q = 0.3;
+		Graphics()->SetColor(q, q, q, 0.7f);
+
+    vec2 pos = m_aCorners[i];
+
+		IGraphics::CQuadItem QuadItem(pos.x - 16, pos.y - 16, 32, 32);
+		Graphics()->QuadsDrawTL(&QuadItem, 1);
+  }
+
+	Graphics()->QuadsEnd();
+
+	IGraphics::CLineItem Array[1024];
+	int NumItems = 0;
+	Graphics()->LinesBegin();
+  for (int i = 0; i < m_aTriangles.size(); i++) {
+    CTriangle t = *m_aTriangles[i];
+
+    Array[NumItems++] = IGraphics::CLineItem(t.m_A.x, t.m_A.y, t.m_B.x, t.m_B.y);
+    if(NumItems == 1024)
+    {
+      Graphics()->LinesDraw(Array, 1024);
+      NumItems = 0;
+    }
+
+    Array[NumItems++] = IGraphics::CLineItem(t.m_C.x, t.m_C.y, t.m_B.x, t.m_B.y);
+    if(NumItems == 1024)
+    {
+      Graphics()->LinesDraw(Array, 1024);
+      NumItems = 0;
+    }
+
+    Array[NumItems++] = IGraphics::CLineItem(t.m_A.x, t.m_A.y, t.m_C.x, t.m_C.y);
+    if(NumItems == 1024)
+    {
+      Graphics()->LinesDraw(Array, 1024);
+      NumItems = 0;
+    }
+  }
+	if(NumItems)
+		Graphics()->LinesDraw(Array, NumItems);
+	Graphics()->LinesEnd();
+
+
+
+  if (m_aTrianglesPath.empty())
+    return;
+
+	const CNetObj_Character * pPlayerChar = m_pClient->m_Snap.m_pLocalCharacter;
+	const CNetObj_Character * pPrevChar = m_pClient->m_Snap.m_pLocalPrevCharacter;
+
+	if (!m_pField || !pPlayerChar || !pPrevChar)
+		return;
+
+	vec2 LocalPosition = mix(vec2(pPrevChar->m_X, pPrevChar->m_Y), vec2(pPlayerChar->m_X, pPlayerChar->m_Y), Client()->IntraGameTick());
+
+  NumItems = 0;
+	Graphics()->LinesBegin();
+  Graphics()->SetColor(0.2f, 0.7f, 0.2f, 0.7f);
+  for (int i = 1; i < m_aTrianglesPath.size(); i++) {
+    Array[NumItems++] = IGraphics::CLineItem(m_aTrianglesPath[i - 1].x, m_aTrianglesPath[i - 1].y, m_aTrianglesPath[i].x, m_aTrianglesPath[i].y);
+    if(NumItems == 1024)
+    {
+      Graphics()->LinesDraw(Array, 1024);
+      NumItems = 0;
+    }
+  }
+	if(NumItems)
+		Graphics()->LinesDraw(Array, NumItems);
+	Graphics()->LinesEnd();
+}
+
+
+
+struct TriangleAStarNode
+{
+  public:
+    bool m_Open;
+
+    CTriangle * m_pTriangle;
+
+    float m_Distance;
+    float m_Price;
+
+    TriangleAStarNode * m_pPrev;
+};
+
+CTrianglePathCache CBot::ComputeTrianglesPath(CTriangle * pFrom, CTriangle * pTo) {
+	m_aTrianglesPath.clear();
+
+  if (!pFrom || !pTo)
+    return CTrianglePathCache();
+
+  if (!m_aTrianglesPathCache.empty()) {
+    for (int i = 0; i < m_aTrianglesPathCache.size(); i++) {
+      if (m_aTrianglesPathCache[i].m_pFrom == pFrom && m_aTrianglesPathCache[i].m_pTo == pTo) {
+        m_aTrianglesPath = m_aTrianglesPathCache[i].m_Path;
+        return m_aTrianglesPathCache[i];
+      }
+    }
+  }
+
+  std::vector<TriangleAStarNode *> aNodes;
+
+  TriangleAStarNode * pFirst = (TriangleAStarNode *)mem_alloc(sizeof(TriangleAStarNode), 1);
+  pFirst->m_Open = true;
+  pFirst->m_pTriangle = pFrom;
+  pFirst->m_Distance = distance(pFrom->m_Center, pTo->m_Center);
+  pFirst->m_Price = 0;
+  pFirst->m_pPrev = NULL;
+  aNodes.push_back(pFirst);
+
+  while(true) {
+    TriangleAStarNode * pNode = NULL;
+    for (int i = 0; i < aNodes.size(); i++) {
+      if (!aNodes[i]->m_Open)
+        continue;
+
+      if (!pNode || pNode->m_Price > aNodes[i]->m_Price)
+        pNode = aNodes[i];
+    }
+
+    if (pNode && pNode->m_pTriangle == pTo) {
+      while(pNode) {
+        m_aTrianglesPath.push_back(pNode->m_pTriangle->m_Center);
+        pNode = pNode->m_pPrev;
+      }
+      break;
+    }
+
+    if (!pNode)
+      break;
+
+    pNode->m_Open = false;
+    for (int i = 0; i < pNode->m_pTriangle->m_aNeighbours.size(); i++) {
+      CTriangle * pTriangle = pNode->m_pTriangle->m_aNeighbours[i];
+
+      if (Collision()->IntersectLine(pNode->m_pTriangle->m_Center, pTriangle->m_Center, NULL, NULL))
+        continue;
+
+      float dist = distance(pNode->m_pTriangle->m_Center, pTriangle->m_Center);
+      float price = pNode->m_Price + dist;
+
+      bool exists = false;
+
+      for (int j = 0; j < aNodes.size(); j++) {
+        if (aNodes[j]->m_pTriangle == pTriangle) {
+          exists = true;
+
+          if (price < aNodes[j]->m_Price) {
+            aNodes[j]->m_Open = true;
+            aNodes[j]->m_Distance = dist;
+            aNodes[j]->m_Price = price;
+            aNodes[j]->m_pPrev = pNode;
+          }
+
+          break;
+        }
+      }
+
+      if (exists)
+        continue;
+
+      TriangleAStarNode * pNewNode = (TriangleAStarNode *)mem_alloc(sizeof(TriangleAStarNode), 1);
+      pNewNode->m_Open = true;
+      pNewNode->m_pTriangle = pTriangle;
+      pNewNode->m_Distance = dist;
+      pNewNode->m_Price = price;
+      pNewNode->m_pPrev = pNode;
+      aNodes.push_back(pNewNode);
+    }
+  }
+
+	for (int i = 0; i < aNodes.size(); i++)
+		mem_free(aNodes[i]);
+	aNodes.clear();
+
+
+
+  char * pField = (char *)mem_alloc(m_Width * m_Height, 1);
+  std::vector<CTriangle *> apTriangles;
+
+  if (m_aTrianglesPath.empty()) {
+    mem_copy(pField, m_pField, m_Width * m_Height * sizeof(char));
+  } else {
+    for (int i = 0; i < m_aTrianglesPath.size(); i++) {
+      CTriangle * pTriangle = FindTriangle(m_aTrianglesPath[i]);
+      if (pTriangle)
+        apTriangles.push_back(pTriangle);
+    }
+
+    printf("\n-------------------\n");
+
+    for (int j = 0; j < m_Height; j++) {
+      for (int i = 0; i < m_Width; i++) {
+        vec2 p(i * 32.0f, j * 32.0f);
+        bool found = false;
+
+        for (int q = 0; q < apTriangles.size(); q++) {
+          CTriangle * pTriangle = apTriangles[q];
+          if (PointInTriangle(pTriangle->m_A, pTriangle->m_B, pTriangle->m_C, p) ||
+              PointInTriangle(pTriangle->m_A, pTriangle->m_B, pTriangle->m_C, p + vec2(32.0f, 32.0f))) {
+            found = true;
+            break;
+          }
+        }
+
+        pField[GetFieldIndex(i, j)] = found ? m_pField[GetFieldIndex(i, j)] : 0;
+        printf("%c", found ? ' ' : '*');
+      }
+
+      printf("\n");
+    }
+    printf("-------------------\n");
+  }
+
+  CTrianglePathCache cache;
+  cache.m_pFrom = pFrom;
+  cache.m_pTo = pTo;
+  cache.m_Path = m_aTrianglesPath;
+  cache.m_pField = pField;
+  m_aTrianglesPathCache.push_back(cache);
+
+  return cache;
+}
+
+CTrianglePathCache CBot::ComputeTrianglesPath() {
+	const CNetObj_Character * pPlayerChar = m_pClient->m_Snap.m_pLocalCharacter;
+	const CNetObj_Character * pPrevChar = m_pClient->m_Snap.m_pLocalPrevCharacter;
+
+	if (!m_pField || !pPlayerChar || !pPrevChar)
+		return CTrianglePathCache();
+
+	vec2 LocalPosition = mix(vec2(pPrevChar->m_X, pPrevChar->m_Y), vec2(pPlayerChar->m_X, pPlayerChar->m_Y), Client()->IntraGameTick());
+
+  CTriangle * pFrom = FindTriangle(LocalPosition);
+  CTriangle * pTo = FindTriangle(m_MoveTargetPos);
+
+  return ComputeTrianglesPath(pFrom, pTo);
+}
+
+float CBot::ComputeTrianglesPathLength(vec2 From, vec2 To) {
+  CTriangle * pFrom = FindTriangle(From);
+  CTriangle * pTo = FindTriangle(To);
+
+  if (!pFrom || !pTo || pFrom == pTo) {
+    return distance(From, To);
+  }
+
+  ComputeTrianglesPath(pFrom, pTo);
+
+  if (m_aTrianglesPath.empty()) {
+    return distance(From, To);
+  }
+
+  float dist = 0.0f;
+  if (m_aTrianglesPath.size() > 1) {
+    for (int i = 1; i < m_aTrianglesPath.size(); i++) {
+      dist += distance(m_aTrianglesPath[i - 1], m_aTrianglesPath[i]);
+    }
+  } else {
+    return distance(From, To);
+  }
+
+  return dist;
+}
+
+CTriangle * CBot::FindTriangle(vec2 p) {
+  if (m_aTriangles.empty())
+    return NULL;
+
+  for (int i = 0; i < m_aTriangles.size(); i++) {
+    CTriangle * pTriangle = m_aTriangles[i];
+    if (PointInTriangle(pTriangle->m_A, pTriangle->m_B, pTriangle->m_C, p)) {
+      return pTriangle;
+    }
+  }
+
+  return NULL;
+}
+
+char * CBot::GetTrianglesPathField() {
+  return ComputeTrianglesPath().m_pField;
+}
+
+
+double D3x3(
+	double a11, double a12, double a13,
+  double a21, double a22, double a23,
+  double a31, double a32, double a33
+    ) {
+	return a11*a22*a33 + a12*a23*a31 + a13*a21*a32 - a11*a23*a32 - a12*a21*a33 - a13*a22*a31;
+}
+
+vec2 Circumcenter(vec2 a, vec2 b, vec2 c) {
+	double D = 2.0 * D3x3(
+  	a.x, a.y, 1,
+  	b.x, b.y, 1,
+    c.x, c.y, 1
+  );
+
+  double xc = (1 / D) * D3x3(
+  	(a.x * a.x) + (a.y * a.y), a.y, 1,
+  	(b.x * b.x) + (b.y * b.y), b.y, 1,
+  	(c.x * c.x) + (c.y * c.y), c.y, 1
+  );
+
+  double yc = -(1 / D) * D3x3(
+  	(a.x * a.x) + (a.y * a.y), a.x, 1,
+  	(b.x * b.x) + (b.y * b.y), b.x, 1,
+  	(c.x * c.x) + (c.y * c.y), c.x, 1
+  );
+
+  return vec2(xc, yc);
+}
+
+
+CTriangle * CBot::AddTriangle(vec2 a, vec2 b, vec2 c, int ia, int ib, int ic) {
+  CTriangle * t = new CTriangle;
+  t->m_A = a;
+  t->m_B = b;
+  t->m_C = c;
+  t->m_iA = ia;
+  t->m_iB = ib;
+  t->m_iC = ic;
+
+  t->m_Center = vec2(
+    (a.x + b.x + c.x) / 3,
+    (a.y + b.y + c.y) / 3
+  );
+
+  m_aTriangles.push_back(t);
+  return t;
+}
+
+bool CBot::PointInTriangle(vec2 p0, vec2 p1, vec2 p2, vec2 p) {
+  /*
+  vec2 center = vec2((a.x + b.x + c.x) / 3.0f, (a.y + b.y + c.y) / 3.0f);
+  return
+    sign(orient(a, b, p)) == sign(orient(a, b, center)) &&
+    sign(orient(b, c, p)) == sign(orient(b, c, center)) &&
+    sign(orient(c, a, p)) == sign(orient(c, a, center));
+*/
+
+
+  float s = p0.y * p2.x - p0.x * p2.y + (p2.y - p0.y) * p.x + (p0.x - p2.x) * p.y;
+  float t = p0.x * p1.y - p0.y * p1.x + (p0.y - p1.y) * p.x + (p1.x - p0.x) * p.y;
+
+  if ((s < 0) != (t < 0))
+      return false;
+
+  float A = -p1.y * p2.x + p0.y * (p2.x - p1.x) + p0.x * (p1.y - p2.y) + p1.x * p2.y;
+  if (A < 0.0)
+  {
+      s = -s;
+      t = -t;
+      A = -A;
+  }
+  return s > 0 && t > 0 && (s + t) < A;
+}
+
+bool CBot::TrianglesEqual(CTriangle * t1, CTriangle * t2) {
+  if (!t1 || !t2)
+    return false;
+
+  int eq = 0;
+
+  if (t1->m_iA == t2->m_iA) eq++;
+  if (t1->m_iB == t2->m_iA) eq++;
+  if (t1->m_iC == t2->m_iA) eq++;
+
+  if (t1->m_iA == t2->m_iB) eq++;
+  if (t1->m_iB == t2->m_iB) eq++;
+  if (t1->m_iC == t2->m_iB) eq++;
+
+  if (t1->m_iA == t2->m_iC) eq++;
+  if (t1->m_iB == t2->m_iC) eq++;
+  if (t1->m_iC == t2->m_iC) eq++;
+
+  return eq == 3;
+}
+
+bool CBot::TrianglesNearby(CTriangle * t1, CTriangle * t2) {
+  if (!t1 || !t2)
+    return false;
+
+  int eq = 0;
+
+  if (t1->m_iA == t2->m_iA) eq++;
+  if (t1->m_iB == t2->m_iA) eq++;
+  if (t1->m_iC == t2->m_iA) eq++;
+
+  if (t1->m_iA == t2->m_iB) eq++;
+  if (t1->m_iB == t2->m_iB) eq++;
+  if (t1->m_iC == t2->m_iB) eq++;
+
+  if (t1->m_iA == t2->m_iC) eq++;
+  if (t1->m_iB == t2->m_iC) eq++;
+  if (t1->m_iC == t2->m_iC) eq++;
+
+  return eq == 2;
+}
+
+void CBot::ComputeTriangles() {
+  m_aCorners.clear();
+
+  if (!m_aTriangles.empty()) {
+    for (int i = 0; i < m_aTriangles.size(); i++) {
+      delete m_aTriangles[i];
+    }
+  }
+  m_aTriangles.clear();
+
+  m_aCorners.push_back(vec2(0, 0));
+  m_aCorners.push_back(vec2(m_Width * 32.0f, 0));
+  m_aCorners.push_back(vec2(0, m_Height * 32.0f));
+  m_aCorners.push_back(vec2(m_Width * 32.0f, m_Height * 32.0f));
+
+  char * pCornersField = (char *)mem_alloc(m_Width * m_Height * sizeof(char), 1);
+
+  printf("\n");
+  for (int y = 0; y < m_Height; y++) {
+    for (int x = 0; x < m_Width; x++) {
+      int neighs = 0;
+      for (int qx = x - 1; qx <= x + 1; qx++) {
+        for (int qy = y - 1; qy <= y + 1; qy++) {
+          if (qx < 0 || qy < 0 || qx >= m_Width || qy >= m_Height || m_pField[GetFieldIndex(qx, qy)] == 0) {
+            neighs++;
+          }
+        }
+      }
+
+      pCornersField[GetFieldIndex(x, y)] = neighs;
+
+      if (neighs == 0 || neighs == 9 || neighs == 6)
+        printf(" ");
+      else
+        printf("%d", neighs);
+
+
+      if (neighs == 4 || neighs == 8) {
+        m_aCorners.push_back(vec2(x * 32.0f + 16.0f, y * 32.0f + 16.0f));
+      }
+    }
+    printf("\n");
+  }
+
+  mem_free(pCornersField);
+
+  printf("Corners found: %d\n", m_aCorners.size());
+
+  for (int i = 0; i < m_aCorners.size(); i++) {
+    for (int j = i; j < m_aCorners.size(); j++) {
+      if (i == j)
+        continue;
+
+      for (int k = j; k < m_aCorners.size(); k++) {
+        if (i == k || j == k)
+          continue;
+
+        CTriangle t;
+        t.m_A = m_aCorners[i];
+        t.m_B = m_aCorners[j];
+        t.m_C = m_aCorners[k];
+        t.m_iA = i;
+        t.m_iB = j;
+        t.m_iC = k;
+
+        vec2 center = Circumcenter(t.m_A, t.m_B, t.m_C);
+        float radius = distance(center, t.m_A);
+
+        if (center.x < 0 || center.x > m_Width * 32 ||
+            center.y < 0 || center.y > m_Height * 32)
+          continue;
+
+        bool inside = false;
+        for (int q = 0; q < m_aCorners.size(); q++) {
+          if (i == q || j == q || k == q)
+            continue;
+
+          if (distance(m_aCorners[q], center) < radius) {
+            inside = true;
+            break;
+          }
+        }
+
+        if (inside)
+          continue;
+
+        bool exists = false;
+        for (int q = 0; q < m_aTriangles.size(); q++) {
+          if (TrianglesEqual(&t, m_aTriangles[q])) {
+            exists = true;
+            break;
+          }
+        }
+
+        if (exists)
+          continue;
+
+        AddTriangle(t.m_A, t.m_B, t.m_C, t.m_iA, t.m_iB, t.m_iC);
+      }
+    }
+  }
+
+  printf("Triangles found: %d\n", m_aTriangles.size());
+
+  for (int i = 0; i < m_aTriangles.size(); i++) {
+    for (int j = 0; j < m_aTriangles.size(); j++) {
+      if (i == j) continue;
+
+      if (TrianglesNearby(m_aTriangles[i], m_aTriangles[j])) {
+        m_aTriangles[i]->m_aNeighbours.push_back(m_aTriangles[j]);
+      }
+    }
+  }
+
+  printf("Neighbours found\n");
+}
+
+void CBot::LoadMapData()
+{
+	m_aEntities.clear();
+
+	CMapItemLayerTilemap * pTileMap = Layers()->GameLayer();
+	CTile *pTiles = (CTile *)Kernel()->RequestInterface<IMap>()->GetData(pTileMap->m_Data);
+
+	for(int y = 0; y < pTileMap->m_Height; y++)
+	{
+		for(int x = 0; x < pTileMap->m_Width; x++)
+		{
+			int Index = pTiles[y * pTileMap->m_Width + x].m_Reserved;
+
+			if(Index >= ENTITY_OFFSET)
+			{
+				CBotEntity entity;
+				entity.m_FieldPosition = ivec2(x, y);
+				entity.m_Position = vec2(x * 32.0f + 16.0f, y * 32.0f + 16.0f);
+				entity.m_Type = Index - ENTITY_OFFSET;
+        entity.m_Need = false;
+        entity.m_Active = false;
+
+        if (entity.m_Type == ENTITY_SPAWN || entity.m_Type == ENTITY_SPAWN_RED || entity.m_Type == ENTITY_SPAWN_BLUE)
+          continue;
+
+				m_aEntities.push_back(entity);
+			}
+		}
+	}
+
+	ChooseNewMoveTarget();
+
+	if (m_pField)
+		mem_free(m_pField);
+	if (m_pFatField)
+		mem_free(m_pFatField);
+	if (m_pDangerField)
+		mem_free(m_pDangerField);
+	if (m_pDangerFatField)
+		mem_free(m_pDangerFatField);
+
+	m_Width = Collision()->GetWidth();
+	m_Height = Collision()->GetHeight();
+
+	m_pField = (char *)mem_alloc(m_Width * m_Height * sizeof(char), 1);
+	for (int y = 0; y < m_Height; y++)
+	{
+		for (int x = 0; x < m_Width; x++)
+		{
+			m_pField[GetFieldIndex(x, y)] = Collision()->CheckPoint(x * 32, y * 32) ? 0 : 1;
+		}
+	}
+
+	for(int y = 0; y < m_Height; y++)
+	{
+    int NoHookX = -1;
+		for(int x = 0; x < m_Width; x++)
+		{
+			int Index = pTiles[y * pTileMap->m_Width + x].m_Reserved;
+
+      if (Index == TILE_SOLID)
+        NoHookX = -1;
+      else if (Index == TILE_NOHOOK)
+      {
+        if (NoHookX >= 0)
+          for (int qx = NoHookX; qx <= x; qx++)
+            m_pField[GetFieldIndex(qx, y)] = 0;
+        NoHookX = x;
+      }
+		}
+	}
+
+	m_pFatField = (char *)mem_alloc(m_Width * m_Height * sizeof(char), 1);
+  mem_zero(m_pFatField, m_Width * m_Height * sizeof(char));
+	for (int y = 0; y < m_Height; y++)
+	{
+		for (int x = 0; x < m_Width; x++)
+		{
+			m_pFatField[GetFieldIndex(x, y)] |= 1 - m_pField[GetFieldIndex(x, y)];
+      if (x > 0)
+  			m_pFatField[GetFieldIndex(x, y)] |= 1 - m_pField[GetFieldIndex(x - 1, y)];
+      if (x < m_Width - 1)
+        m_pFatField[GetFieldIndex(x, y)] |= 1 - m_pField[GetFieldIndex(x + 1, y)];
+      if (y > 0)
+  			m_pFatField[GetFieldIndex(x, y)] |= 1 - m_pField[GetFieldIndex(x, y - 1)];
+      if (y < m_Height - 1)
+  			m_pFatField[GetFieldIndex(x, y)] |= 1 - m_pField[GetFieldIndex(x, y + 1)];
+
+      m_pFatField[GetFieldIndex(x, y)] = 1 - m_pFatField[GetFieldIndex(x, y)];
+		}
+	}
+
+	m_pDangerField = (char *)mem_alloc(m_Width * m_Height * sizeof(char), 1);
+	m_pDangerFatField = (char *)mem_alloc(m_Width * m_Height * sizeof(char), 1);
+  mem_copy(m_pDangerField, m_pField, m_Width * m_Height * sizeof(char));
+  mem_copy(m_pDangerFatField, m_pFatField, m_Width * m_Height * sizeof(char));
+
+  m_aJPSCache.clear();
+
+  //ComputeTriangles();
+}
+
+void CBot::UpdateDangerFields()
+{
+  mem_copy(m_pDangerField, m_pField, m_Width * m_Height * sizeof(char));
+  mem_copy(m_pDangerFatField, m_pFatField, m_Width * m_Height * sizeof(char));
+
+	if(Client()->State() < IClient::STATE_ONLINE)
+		return;
+
+  int Num = Client()->SnapNumItems(IClient::SNAP_CURRENT);
+  for(int i = 0; i < Num; i++)
+  {
+    IClient::CSnapItem Item;
+    const void *pData = Client()->SnapGetItem(IClient::SNAP_CURRENT, i, &Item);
+
+    if (Item.m_Type == NETOBJTYPE_PROJECTILE)
+    {
+      const CNetObj_Projectile * pCurrent = (const CNetObj_Projectile *)pData;
+
+      float Curvature, Speed, Lifetime;
+      if(pCurrent->m_Type == WEAPON_GRENADE)
+      {
+        Curvature = m_pClient->m_Tuning.m_GrenadeCurvature;
+        Speed = m_pClient->m_Tuning.m_GrenadeSpeed;
+        Lifetime = m_pClient->m_Tuning.m_GrenadeLifetime;
+      }
+      else if(pCurrent->m_Type == WEAPON_SHOTGUN)
+      {
+        Curvature = m_pClient->m_Tuning.m_ShotgunCurvature;
+        Speed = m_pClient->m_Tuning.m_ShotgunSpeed;
+        Lifetime = m_pClient->m_Tuning.m_ShotgunLifetime;
+      }
+      else if(pCurrent->m_Type == WEAPON_GUN)
+      {
+        Curvature = m_pClient->m_Tuning.m_GunCurvature;
+        Speed = m_pClient->m_Tuning.m_GunSpeed;
+        Lifetime = m_pClient->m_Tuning.m_GunLifetime;
+      }
+
+      vec2 StartPos(pCurrent->m_X, pCurrent->m_Y);
+      vec2 StartVel(pCurrent->m_VelX/100.0f, pCurrent->m_VelY/100.0f);
+
+      for (float Time = 0; Time < Lifetime; Time += 1.0f / Client()->GameTickSpeed()) {
+        vec2 Pos = CalcPos(StartPos, StartVel, Curvature, Speed, Time);
+        if (Collision()->CheckPoint(Pos))
+          break;
+
+        ivec2 iPos((int)round(Pos.x / 32.0f), (int)round(Pos.y / 32.0f));
+        if (Pos.x < 0 || Pos.y < 0 || Pos.x >= m_Width || Pos.y >= m_Height)
+          continue;
+
+        m_pDangerField[GetFieldIndex(iPos.x, iPos.y)] = 0;
+
+        m_pDangerFatField[GetFieldIndex(iPos.x, iPos.y)] = 0;
+        if (iPos.x > 0)
+          m_pDangerFatField[GetFieldIndex(iPos.x - 1, iPos.y)] = 0;
+        if (iPos.y > 0)
+          m_pDangerFatField[GetFieldIndex(iPos.x, iPos.y - 1)] = 0;
+        if (iPos.x < m_Width - 1)
+          m_pDangerFatField[GetFieldIndex(iPos.x + 1, iPos.y)] = 0;
+        if (iPos.y < m_Height - 1)
+          m_pDangerFatField[GetFieldIndex(iPos.x, iPos.y + 1)] = 0;
+      }
+    }
+  }
+}
+
+CNetObj_PlayerInput CBot::GetInputData()
+{
+	CNetObj_PlayerInput input = {0};
+
+  UpdateDangerFields();
+
+  //ComputeTrianglesPath();
+
+	input = ComputeAStar();
+
+  const CNetObj_Character * pPlayerChar = m_pClient->m_Snap.m_pLocalCharacter;
+
+  if (pPlayerChar) {
+    if (!input.m_Hook || pPlayerChar->m_HookState != HOOK_IDLE) {
+      input = Shoot(input);
+    }
+
+    if (!(input.m_Hook && pPlayerChar->m_HookState == HOOK_IDLE) && !input.m_Fire) {
+      input.m_TargetX = m_PrevInput.m_TargetX;
+      input.m_TargetY = m_PrevInput.m_TargetY;
+    }
+  }
+
+  m_PrevInput = input;
+
+	return input;
+}
+
+void CBot::UpdateSnapData()
+{
+  return; // not realized yet
+
+	int Num = Client()->SnapNumItems(IClient::SNAP_CURRENT);
+	for(int i = 0; i < Num; i++)
+	{
+		IClient::CSnapItem Item;
+		const void *pData = Client()->SnapGetItem(IClient::SNAP_CURRENT, i, &Item);
+	}
+}
+
+bool CBot::IsFlagholder()
+{
+  if (!m_pClient->m_Snap.m_pGameData)
+    return false;
+
+  const CNetObj_Character * pPlayerChar = m_pClient->m_Snap.m_pLocalCharacter;
+  const CNetObj_Character * pPrevChar = m_pClient->m_Snap.m_pLocalPrevCharacter;
+
+  if (!pPlayerChar || !pPrevChar)
+    return false;
+
+  vec2 LocalPosition = mix(vec2(pPrevChar->m_X, pPrevChar->m_Y), vec2(pPlayerChar->m_X, pPlayerChar->m_Y), Client()->IntraGameTick());
+  ivec2 FieldPosition = ivec2((int)round(LocalPosition.x / 32), (int)round(LocalPosition.y / 32));
+
+	bool IsTeamplay = (m_pClient->m_GameInfo.m_GameFlags&GAMEFLAG_TEAMS) != 0;
+
+  if (!IsTeamplay)
+    return false;
+
+  int Num = Client()->SnapNumItems(IClient::SNAP_CURRENT);
+  for(int i = 0; i < Num; i++)
+  {
+    IClient::CSnapItem Item;
+    const void *pData = Client()->SnapGetItem(IClient::SNAP_CURRENT, i, &Item);
+
+    if (Item.m_Type == NETOBJTYPE_FLAG)
+    {
+      const CNetObj_Flag * pFlag = static_cast<const CNetObj_Flag *>(pData);
+      ivec2 Pos((int)round(pFlag->m_X / 32.0f), (int)round(pFlag->m_Y / 32.0f));
+
+		  int LocalPlayerTeam = m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team;
+      if (LocalPlayerTeam != pFlag->m_Team && distance(Pos, FieldPosition) <= 1)
+        return true;
+    }
+  }
+
+  return false;
+}
+
+CBotEntity * CBot::FindEntityByType(int Type)
+{
+  for (int i = 0; i < m_aEntities.size(); i++)
+  {
+    if (m_aEntities[i].m_Type == Type)
+      return &m_aEntities[i];
+  }
+  return NULL;
+}
+
+void CBot::UpdateEntities(bool Active)
+{
+  if (!m_pClient->m_Snap.m_pGameData)
+    return;
+
+  const CNetObj_Character * pPlayerChar = m_pClient->m_Snap.m_pLocalCharacter;
+  const CNetObj_Character * pPrevChar = m_pClient->m_Snap.m_pLocalPrevCharacter;
+
+  if (!pPlayerChar || !pPrevChar) {
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "bot", "can't update entities, no player found");
+
+    return;
+  }
+
+  vec2 LocalPosition = mix(vec2(pPrevChar->m_X, pPrevChar->m_Y), vec2(pPlayerChar->m_X, pPlayerChar->m_Y), Client()->IntraGameTick());
+  ivec2 FieldPosition = ivec2((int)round(LocalPosition.x / 32), (int)round(LocalPosition.y / 32));
+
+	bool IsTeamplay = (m_pClient->m_GameInfo.m_GameFlags&GAMEFLAG_TEAMS) != 0;
+  bool IsFlagholder = this->IsFlagholder();
+  bool SeeFlag[2] = {false, false};
+
+  bool HasFlags = false;
+
+  for (int i = m_aEntities.size() - 1; i >= 0; i--)
+  {
+    m_aEntities[i].m_Active = false;
+
+    if (m_aEntities[i].m_Type > ENTITY_BOT_EXTENDED)
+    {
+      m_aEntities.erase(m_aEntities.begin() + i);
+    }
+  }
+
+  if (Active)
+  {
+    int Num = Client()->SnapNumItems(IClient::SNAP_CURRENT);
+    for(int i = 0; i < Num; i++)
+    {
+      IClient::CSnapItem Item;
+      const void *pData = Client()->SnapGetItem(IClient::SNAP_CURRENT, i, &Item);
+
+      if(Item.m_Type == NETOBJTYPE_PICKUP)
+      {
+        const CNetObj_Pickup * pPickup = (const CNetObj_Pickup *)pData;
+        ivec2 Pos((int)round(pPickup->m_X / 32.0f), (int)round(pPickup->m_Y / 32.0f));
+
+        int EntityType;
+        switch(pPickup->m_Type)
+        {
+          case PICKUP_HEALTH:
+            EntityType = ENTITY_HEALTH_1;
+            break;
+          case PICKUP_ARMOR:
+            EntityType = ENTITY_ARMOR_1;
+            break;
+          case PICKUP_GRENADE:
+            EntityType = ENTITY_WEAPON_GRENADE;
+            break;
+          case PICKUP_SHOTGUN:
+            EntityType = ENTITY_WEAPON_SHOTGUN;
+            break;
+          case PICKUP_LASER:
+            EntityType = ENTITY_WEAPON_LASER;
+            break;
+          case PICKUP_NINJA:
+            EntityType = ENTITY_POWERUP_NINJA;
+            break;
+        }
+
+        for (int j = 0; j < m_aEntities.size(); j++)
+        {
+          if (m_aEntities[j].m_Type != EntityType)
+            continue;
+
+          if (distance(m_aEntities[j].m_FieldPosition, Pos) < 2)
+            m_aEntities[j].m_Active = true;
+        }
+      }
+      else if (Item.m_Type == NETOBJTYPE_FLAG)
+      {
+        const CNetObj_Flag * pFlag = static_cast<const CNetObj_Flag *>(pData);
+        ivec2 Pos((int)round(pFlag->m_X / 32.0f) - 1, (int)round(pFlag->m_Y / 32.0f) - 1);
+
+        HasFlags = true;
+
+        //if (IsTeamplay && m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team != pFlag->m_Team && distance(Pos, FieldPosition) <= 1)
+        //  IsFlagholder = true;
+
+        int EntityType = pFlag->m_Team == TEAM_RED ? ENTITY_FLAGSTAND_RED : ENTITY_FLAGSTAND_BLUE;
+
+        for (int j = 0; j < m_aEntities.size(); j++)
+        {
+          if (m_aEntities[j].m_Type != EntityType)
+            continue;
+
+          if (distance(m_aEntities[j].m_FieldPosition, Pos) < 2)
+          {
+            m_aEntities[j].m_Active = true;
+          }
+        }
+
+        CBotEntity entity;
+        entity.m_FieldPosition = Pos;
+        entity.m_Position = vec2(pFlag->m_X, pFlag->m_Y);
+        entity.m_Type = pFlag->m_Team == TEAM_RED ? ENTITY_FLAG_RED : ENTITY_FLAG_BLUE;
+        entity.m_Active = false;
+
+        // красный флаг
+        if (pFlag->m_Team == TEAM_RED) {
+          if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierRed != FLAG_ATSTAND)
+            entity.m_Active = true;
+          else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_BLUE && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierRed < FLAG_TAKEN)
+            entity.m_Active = true;
+          else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED && IsFlagholder && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierRed == FLAG_ATSTAND)
+            entity.m_Active = true;
+        } else {
+          if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_BLUE && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierBlue != FLAG_ATSTAND)
+            entity.m_Active = true;
+          else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierBlue < FLAG_TAKEN)
+            entity.m_Active = true;
+          else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_BLUE && IsFlagholder && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierBlue == FLAG_ATSTAND)
+            entity.m_Active = true;
+        }
+
+        m_aEntities.push_back(entity);
+
+        SeeFlag[pFlag->m_Team] = true;
+      }
+    }
+
+    for (int ClientId = 0; ClientId < MAX_CLIENTS; ClientId++) {
+      if (!IsEnemy(ClientId))
+        continue;
+
+      CNetObj_Character Character = m_pClient->m_Snap.m_aCharacters[ClientId].m_Cur;
+
+      CBotEntity entity;
+      entity.m_Position = vec2(Character.m_X, Character.m_Y);
+      entity.m_FieldPosition = ivec2((int)round(Character.m_X / 32.0f) - 1, (int)round(Character.m_Y / 32.0f) - 1);
+      entity.m_Type = ENTITY_ENEMY;
+      entity.m_Active = true;
+
+      m_aEntities.push_back(entity);
+    }
+  }
+  else
+  {
+    for (int i = 0; i < m_aEntities.size(); i++)
+    {
+      m_aEntities[i].m_Active = distance(LocalPosition, m_aEntities[i].m_Position) > 1400;
+    }
+  }
+
+  bool NeedFlag = false;
+
+  for (int i = 0; i < m_aEntities.size(); i++)
+  {
+    if (!m_aEntities[i].m_Active)
+    {
+      m_aEntities[i].m_Need = false;
+      continue;
+    }
+
+    bool need = false;
+
+    switch (m_aEntities[i].m_Type)
+    {
+      case ENTITY_ARMOR_1:
+        need = m_pClient->m_Snap.m_pLocalCharacter->m_Armor < (HasFlags ? 7 : 10);
+        break;
+      case ENTITY_HEALTH_1:
+        need = m_pClient->m_Snap.m_pLocalCharacter->m_Health < (HasFlags ? 7 : 10);
+        break;
+      case ENTITY_WEAPON_SHOTGUN:
+        need = m_aWeapons[WEAPON_SHOTGUN] < (HasFlags ? 7 : 10);
+        break;
+      case ENTITY_WEAPON_GRENADE:
+        need = m_aWeapons[WEAPON_GRENADE] < (HasFlags ? 7 : 10);
+        break;
+      case ENTITY_WEAPON_LASER:
+        need = m_aWeapons[WEAPON_LASER] < (HasFlags ? 7 : 10);
+        break;
+      case ENTITY_FLAGSTAND_RED:
+        if (IsTeamplay && !SeeFlag[TEAM_RED])
+        {
+          if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED && IsFlagholder && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierRed == FLAG_ATSTAND)
+            need = true;
+          else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_BLUE && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierRed == FLAG_ATSTAND)
+            need = true;
+          else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED && IsFlagholder && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierRed == FLAG_ATSTAND) {
+            need = true;
+            NeedFlag = true;
+          }
+        }
+        break;
+      case ENTITY_FLAGSTAND_BLUE:
+        if (IsTeamplay && !SeeFlag[TEAM_BLUE])
+        {
+          if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_BLUE && IsFlagholder && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierBlue == FLAG_ATSTAND)
+            need = true;
+          else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierBlue == FLAG_ATSTAND)
+            need = true;
+          else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_BLUE && IsFlagholder && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierBlue == FLAG_ATSTAND) {
+            need = true;
+            NeedFlag = true;
+          }
+        }
+        break;
+      case ENTITY_FLAG_RED:
+        if (IsTeamplay)
+        {
+          if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierRed != FLAG_ATSTAND) {
+            need = true;
+            NeedFlag = true;
+          } else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_BLUE && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierRed < FLAG_TAKEN) {
+            need = true;
+          } else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED && IsFlagholder && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierRed == FLAG_ATSTAND) {
+            need = true;
+            NeedFlag = true;
+          }
+        }
+        break;
+      case ENTITY_FLAG_BLUE:
+        if (IsTeamplay)
+        {
+          if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_BLUE && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierBlue != FLAG_ATSTAND) {
+            need = true;
+            NeedFlag = true;
+          } else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierBlue < FLAG_TAKEN) {
+            need = true;
+          } else if (m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_BLUE && IsFlagholder && m_pClient->m_Snap.m_pGameDataFlag->m_FlagCarrierBlue == FLAG_ATSTAND) {
+            need = true;
+            NeedFlag = true;
+          }
+        }
+        break;
+      case ENTITY_POWERUP_NINJA: // not realized yet
+        need = false;
+        break;
+      case ENTITY_ENEMY:
+        if(!m_pClient->m_GameInfo.m_GameFlags&GAMEFLAG_TEAMS)
+          need = (m_pClient->m_Snap.m_pLocalCharacter->m_Health > 6) && (m_pClient->m_Snap.m_pLocalCharacter->m_Armor > 3);
+        break;
+    }
+
+    m_aEntities[i].m_Need = need;
+  }
+
+  if (NeedFlag && (m_aWeapons[WEAPON_SHOTGUN] != 0 || m_aWeapons[WEAPON_GRENADE] != 0 || m_aWeapons[WEAPON_LASER] != 0) && (m_pClient->m_Snap.m_pLocalCharacter->m_Health >= 5)) {
+    for (int i = 0; i < m_aEntities.size(); i++)
+    {
+      if (m_aEntities[i].m_Type == ENTITY_FLAG_RED || m_aEntities[i].m_Type == ENTITY_FLAG_BLUE ||
+          m_aEntities[i].m_Type == ENTITY_FLAGSTAND_RED || m_aEntities[i].m_Type == ENTITY_FLAGSTAND_BLUE)
+        continue;
+      m_aEntities[i].m_Need = false;
+    }
+  }
+}
+
+void CBot::ChooseNewMoveTarget()
+{
+	const CNetObj_Character * pPlayerChar = m_pClient->m_Snap.m_pLocalCharacter;
+	const CNetObj_Character * pPrevChar = m_pClient->m_Snap.m_pLocalPrevCharacter;
+
+	if (!pPlayerChar || !pPrevChar) {
+		return;
+  }
+
+	vec2 LocalPosition = mix(vec2(pPrevChar->m_X, pPrevChar->m_Y), vec2(pPlayerChar->m_X, pPlayerChar->m_Y), Client()->IntraGameTick());
+  ivec2 FieldPosition = ivec2((int)round(LocalPosition.x / 32), (int)round(LocalPosition.y / 32));
+
+  CBotEntity * pEntity = NULL;
+
+  bool WasRandom = m_IsMoveTargetRandom;
+  m_IsMoveTargetRandom = false;
+
+  m_aJPSCache.clear();
+  UpdateDangerFields();
+  UpdateEntities(true);
+
+  for (int i = 0; i < m_aEntities.size(); i++)
+  {
+    if (!m_aEntities[i].m_Need)
+      continue;
+
+    m_aEntities[i].m_JPSLength = GetJPSLength(FieldPosition, m_aEntities[i].m_FieldPosition);
+
+    if (!pEntity || (m_aEntities[i].m_JPSLength && pEntity->m_JPSLength > m_aEntities[i].m_JPSLength))
+      pEntity = &m_aEntities[i];
+  }
+
+  if (!pEntity)
+  {
+    if (IsFlagholder())
+    {
+      pEntity = FindEntityByType(m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team == TEAM_RED ? ENTITY_FLAGSTAND_RED : ENTITY_FLAGSTAND_BLUE);
+    }
+    else
+    {
+      UpdateEntities(false);
+
+      for (int i = 0; i < m_aEntities.size(); i++)
+      {
+        if (!m_aEntities[i].m_Need)
+          continue;
+
+        m_aEntities[i].m_JPSLength = GetJPSLength(FieldPosition, m_aEntities[i].m_FieldPosition);
+
+        if (!pEntity || (m_aEntities[i].m_JPSLength && pEntity->m_JPSLength > m_aEntities[i].m_JPSLength))
+          pEntity = &m_aEntities[i];
+      }
+
+      if (!pEntity)
+      {
+				if (m_aEntities.size() == 0)
+					return;
+
+        m_IsMoveTargetRandom = true;
+        pEntity = &m_aEntities[rand() % m_aEntities.size()];
+      }
+    }
+  }
+
+  if (WasRandom && m_IsMoveTargetRandom && distance(m_FieldMoveTargetPos, FieldPosition) > 3) {
+    return;
+  }
+
+  m_FieldMoveTargetPos = pEntity->m_FieldPosition;
+  m_MoveTargetPos = pEntity->m_Position;
+
+  /*{
+		char aBuf[256];
+		str_format(aBuf, sizeof(aBuf), "moving to x = %d y = %d", m_FieldMoveTargetPos.x, m_FieldMoveTargetPos.y);
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "bot", aBuf);
+  }*/
+}
+
+bool CBot::IsEnemy(int ClientId)
+{
+  if (ClientId == m_pClient->m_LocalClientID || !m_pClient->m_Snap.m_aCharacters[ClientId].m_Active)
+    return false;
+
+  if (!m_pClient->m_Snap.m_pGameData || !m_pClient->m_Snap.m_pLocalInfo || !m_pClient->m_Snap.m_paPlayerInfos[ClientId])
+    return false;
+
+	bool IsTeamplay = false;
+	if(m_pClient->m_Snap.m_pGameData)
+		IsTeamplay = (m_pClient->m_GameInfo.m_GameFlags&GAMEFLAG_TEAMS) != 0;
+
+  if (!IsTeamplay)
+    return true;
+
+  return m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team != m_pClient->m_aClients[ClientId].m_Team;
+}
+
+CNetObj_PlayerInput CBot::Shoot(CNetObj_PlayerInput Input)
+{
+	const CNetObj_Character * pPlayerChar = m_pClient->m_Snap.m_pLocalCharacter;
+	const CNetObj_Character * pPrevChar = m_pClient->m_Snap.m_pLocalPrevCharacter;
+
+	if (!pPlayerChar || !pPrevChar)
+		return Input;
+
+  bool HasEnemies = false;
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (IsEnemy(i)) {
+      HasEnemies = true;
+      break;
+    }
+  }
+
+  if (!HasEnemies)
+    return Input;
+
+  CNetObj_Character PlayerChar = m_pClient->m_Snap.m_aCharacters[m_pClient->m_LocalClientID].m_Cur;
+
+  vec2 CurrLocalPosition = vec2(PlayerChar.m_X, PlayerChar.m_Y);
+
+  Predict(&PlayerChar, Input, Client()->PredGameTick() - Client()->GameTick());
+
+  m_aWeapons[WEAPON_HAMMER] = -1;
+  m_aWeapons[WEAPON_GUN] = 1;
+  m_aWeapons[pPlayerChar->m_Weapon] = pPlayerChar->m_AmmoCount;
+
+  vec2 LocalPosition = vec2(PlayerChar.m_X, PlayerChar.m_Y);
+
+  CNetObj_Character Enemies[MAX_CLIENTS];
+  CNetObj_PlayerInput Inputs[MAX_CLIENTS];
+
+  mem_zero(Enemies, sizeof(CNetObj_Character) * MAX_CLIENTS);
+  mem_zero(Inputs, sizeof(CNetObj_PlayerInput) * MAX_CLIENTS);
+
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (!IsEnemy(i))
+      continue;
+
+    CNetObj_Character Character = m_pClient->m_Snap.m_aCharacters[i].m_Cur;
+    CNetObj_PlayerInput CharacterInput = {0};
+
+    CharacterInput.m_Direction = Character.m_Direction;
+
+    if (!CharacterInput.m_Direction) {
+      if (Character.m_VelX < 0)
+        CharacterInput.m_Direction = -1;
+      else if (Character.m_VelX > 0)
+        CharacterInput.m_Direction = 1;
+    }
+
+    if (Character.m_HookState != HOOK_IDLE)
+      CharacterInput.m_Hook = 1;
+
+    vec2 ClientPos(Character.m_X, Character.m_Y);
+
+    if (distance(ClientPos, vec2(0, 0)) < 16.0f)
+      continue;
+
+    Enemies[i] = Character;
+    Inputs[i] = CharacterInput;
+
+    Predict(&Enemies[i], Inputs[i], Client()->PredGameTick() - Client()->GameTick());
+
+    if (m_aWeapons[WEAPON_SHOTGUN] == 0 && m_aWeapons[WEAPON_GRENADE] == 0 && distance(ClientPos, CurrLocalPosition) <= 48.0f && distance(vec2(Character.m_X, Character.m_Y), LocalPosition) <= 48.0f) {
+      if (pPlayerChar->m_Weapon != WEAPON_HAMMER) {
+        Input.m_WantedWeapon = WEAPON_HAMMER + 1;
+        Input.m_Fire = 0;
+      } else {
+        Input.m_TargetX = ClientPos.x - LocalPosition.x;
+        Input.m_TargetY = ClientPos.y - LocalPosition.y;
+        Input.m_Fire = m_PrevInput.m_Fire == 0 ? 1 : 0;
+
+        if (!Input.m_Hook)
+          Input.m_Hook = 1;
+      }
+
+      return Input;
+    }
+  }
+
+  int MinWeapon = -1;
+  float MinTime = -1;
+  float MinAngle = 0;
+
+  float MaxLifetime = 1.0f / Client()->GameTickSpeed();
+  if (MaxLifetime < m_pClient->m_Tuning.m_GunLifetime)
+    MaxLifetime = m_pClient->m_Tuning.m_GunLifetime;
+  if (MaxLifetime < m_pClient->m_Tuning.m_ShotgunLifetime)
+    MaxLifetime = m_pClient->m_Tuning.m_ShotgunLifetime;
+  if (MaxLifetime < m_pClient->m_Tuning.m_GrenadeLifetime)
+    MaxLifetime = m_pClient->m_Tuning.m_GrenadeLifetime;
+
+  int Collide[NUM_WEAPONS][360];
+  mem_zero(Collide, sizeof(int) * NUM_WEAPONS * 360);
+
+  for (float t = 1.0f / Client()->GameTickSpeed(); t < MaxLifetime; t += 1.0f / Client()->GameTickSpeed()) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+      if (!Enemies[i].m_Tick)
+        continue;
+
+      Predict(&Enemies[i], Inputs[i], 1);
+    }
+
+    for (int a = 0; a < 360; a += 1) {
+      double angle = a * (M_PI / 180.0);
+//    for (double angle = 0.0; angle < M_PI * 2.0; angle += 1.0 * (M_PI / 180.0)) {
+      vec2 Direction = normalize(vec2(cos(angle) - sin(angle), sin(angle) + cos(angle)));
+
+      LocalPosition = vec2(PlayerChar.m_X, PlayerChar.m_Y) + Direction * 24.0f * 0.75f;
+
+      for (int weapon = 0; weapon < NUM_WEAPONS; weapon++) {
+        float Curvature, Speed, Lifetime;
+
+        if ((weapon != WEAPON_HAMMER && weapon != WEAPON_GUN && m_aWeapons[weapon] == 0) || Collide[weapon][a])
+          continue;
+
+        if (weapon == WEAPON_HAMMER) {
+          Curvature = 1.0f / Client()->GameTickSpeed();
+          Speed = 100.0f;
+          Lifetime = 0.20f;
+        }
+        else if (weapon == WEAPON_GUN) {
+          Curvature = m_pClient->m_Tuning.m_GunCurvature;
+          Speed = m_pClient->m_Tuning.m_GunSpeed;
+          Lifetime = m_pClient->m_Tuning.m_GunLifetime;
+        }
+        else if (weapon == WEAPON_SHOTGUN) {
+          Curvature = m_pClient->m_Tuning.m_ShotgunCurvature;
+          Speed = m_pClient->m_Tuning.m_ShotgunSpeed;
+          Lifetime = m_pClient->m_Tuning.m_ShotgunLifetime;
+        }
+        else if (weapon == WEAPON_GRENADE) {
+          Curvature = m_pClient->m_Tuning.m_GrenadeCurvature;
+          Speed = m_pClient->m_Tuning.m_GrenadeSpeed;
+          Lifetime = m_pClient->m_Tuning.m_GrenadeLifetime;
+        }
+        else if (weapon == WEAPON_LASER) {
+          Curvature = 1.0f / Client()->GameTickSpeed();
+          Speed = 7000.0f;
+          Lifetime = 0.20f;
+        }
+        else continue;
+
+        if (Lifetime < t)
+          continue;
+
+        vec2 PrevPos = CalcPos(LocalPosition, Direction, Curvature, Speed, t - 1.0f / Client()->GameTickSpeed());
+        vec2 Pos = CalcPos(LocalPosition, Direction, Curvature, Speed, t);
+
+        Collide[weapon][a] = Collision()->IntersectLine(PrevPos, Pos, &Pos, NULL);
+
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+          if (!Enemies[i].m_Tick)
+            continue;
+
+          if (IntersectCharacter(Enemies[i], Pos, PrevPos, 6.0f)) {
+            MinWeapon = weapon;
+            MinTime = t;
+            MinAngle = angle;
+          }
+        }
+      }
+    }
+
+    if (MinWeapon >= 0) {
+      if (pPlayerChar->m_Weapon != MinWeapon) {
+        Input.m_WantedWeapon = MinWeapon + 1;
+        Input.m_Fire = 0;
+      } else {
+        vec2 Direction = normalize(vec2(cos(MinAngle) - sin(MinAngle), sin(MinAngle) + cos(MinAngle)));
+
+        Input.m_TargetX = Direction.x * 100.0f;
+        Input.m_TargetY = Direction.y * 100.0f;
+        Input.m_Fire = m_PrevInput.m_Fire == 0 ? 1 : 0;
+
+        if (!Input.m_Hook)
+          Input.m_Hook = 1;
+        
+        Input.m_Hook = m_PrevInput.m_Fire == 0 ? 1 : 0;
+
+        if (Input.m_Fire && m_aWeapons[MinWeapon] > 0)
+          m_aWeapons[MinWeapon]--;
+      }
+
+      return Input;
+    }
+  }
+
+  return Input;
+}

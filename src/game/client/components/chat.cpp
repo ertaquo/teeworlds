@@ -263,7 +263,12 @@ bool CChat::OnInput(IInput::CEvent Event)
 		{
 			m_pHistoryEntry = 0x0;
 			m_Mode = CHAT_NONE;
-			m_pClient->OnRelease();
+
+			if (!Config()->m_ClBot) {
+				m_pClient->OnRelease();
+			} else {
+				OnRelease();
+			}
 		}
 	}
 	else if(Event.m_Flags&IInput::FLAG_PRESS && (Event.m_Key == KEY_RETURN || Event.m_Key == KEY_KP_ENTER))
@@ -291,7 +296,12 @@ bool CChat::OnInput(IInput::CEvent Event)
 			}
 			m_pHistoryEntry = 0x0;
 			m_Mode = CHAT_NONE;
-			m_pClient->OnRelease();
+			
+			if (!Config()->m_ClBot) {
+				m_pClient->OnRelease();
+			} else {
+				OnRelease();
+			}
 		}
 
 		if(AddEntry)

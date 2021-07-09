@@ -66,6 +66,8 @@ if(TARGET_OS STREQUAL "windows")
   set(AUTO_DEPENDENCIES_DEFAULT ON)
 endif()
 
+set(CMAKE_CXX_STANDARD 20)
+
 option(CLIENT "Compile client" ON)
 option(DOWNLOAD_DEPENDENCIES "Download dependencies (only available on Windows)" ${AUTO_DEPENDENCIES_DEFAULT})
 option(DOWNLOAD_GTEST "Download and compile GTest if not found" ${AUTO_DEPENDENCIES_DEFAULT})
@@ -486,12 +488,16 @@ add_library(json EXCLUDE_FROM_ALL OBJECT ${DEP_JSON_SRC})
 set_src(DEP_MD5_SRC GLOB src/engine/external/md5 md5.c md5.h)
 add_library(md5 EXCLUDE_FROM_ALL OBJECT ${DEP_MD5_SRC})
 
-list(APPEND TARGETS_DEP json md5)
+set_src(DEP_ASTAR_JPS_SRC GLOB src/engine/external/astar-jps AStar.c AStar.h IndexPriorityQueue.c IndexPriorityQueue.h)
+add_library(astarjps EXCLUDE_FROM_ALL OBJECT ${DEP_ASTAR_JPS_SRC})
+
+list(APPEND TARGETS_DEP json md5 astarjps)
 set(DEP_JSON $<TARGET_OBJECTS:json>)
 set(DEP_MD5)
 if(NOT CRYPTO_FOUND)
   set(DEP_MD5 $<TARGET_OBJECTS:md5>)
 endif()
+set(DEP_ASTAR_JPS $<TARGET_OBJECTS:astarjps>)
 
 ########################################################################
 # DATA
@@ -1382,7 +1388,7 @@ set(GAME_GENERATED_SHARED
   src/generated/protocol.h
 )
 
-set(DEPS ${DEP_JSON} ${DEP_MD5} ${ZLIB_DEP})
+set(DEPS ${DEP_JSON} ${DEP_MD5} ${ZLIB_DEP} ${DEP_ASTAR_JPS})
 
 # Libraries
 set(LIBS ${CMAKE_THREAD_LIBS_INIT} ${ZLIB_LIBRARIES} ${CRYPTO_LIBRARIES} ${PLATFORM_LIBS})
@@ -1427,6 +1433,8 @@ if(CLIENT)
     animstate.cpp
     animstate.h
     component.h
+    components/bot.cpp
+    components/bot.h
     components/binds.cpp
     components/binds.h
     components/broadcast.cpp

@@ -103,9 +103,13 @@ function GenerateCommonSettings(settings, conf, arch, compiler)
 	local wavpack = Compile(settings, Collect("src/engine/external/wavpack/*.c"))
 	local png = Compile(settings, Collect("src/engine/external/pnglite/*.c"))
 	local json = Compile(settings, Collect("src/engine/external/json-parser/*.c"))
+	local astarjps = Compile(settings, Collect("src/engine/external/astar-jps/AStar.c", "src/engine/external/astar-jps/IndexPriorityQueue.c"))
 
 	-- globally available libs
-	libs = {zlib=zlib, wavpack=wavpack, png=png, md5=md5, json=json}
+	libs = {zlib=zlib, wavpack=wavpack, png=png, md5=md5, json=json, astarjps=astarjps}
+
+	settings.cc.flags:Add("-std=c++20")
+	settings.link.flags:Add("-std=c++20")
 end
 
 function GenerateMacOSXSettings(settings, conf, arch, compiler)
@@ -355,7 +359,7 @@ function BuildClient(settings, family, platform)
 	local game_client = Compile(settings, CollectRecursive("src/game/client/*.cpp"), SharedClientFiles())
 	local game_editor = Compile(settings, Collect("src/game/editor/*.cpp"))
 	
-	Link(settings, "teeworlds", libs["zlib"], libs["md5"], libs["wavpack"], libs["png"], libs["json"], client, game_client, game_editor)
+	Link(settings, "teeworlds", libs["astarjps"], libs["zlib"], libs["md5"], libs["wavpack"], libs["png"], libs["json"], client, game_client, game_editor)
 end
 
 function BuildServer(settings, family, platform)
@@ -370,7 +374,7 @@ function BuildTools(settings)
 	local tools = {}
 	for i,v in ipairs(Collect("src/tools/*.cpp", "src/tools/*.c")) do
 		local toolname = PathFilename(PathBase(v))
-		tools[i] = Link(settings, toolname, Compile(settings, v), libs["zlib"], libs["md5"], libs["wavpack"], libs["png"])
+		tools[i] = Link(settings, toolname, Compile(settings, v), libs["astarjps"], libs["zlib"], libs["md5"], libs["wavpack"], libs["png"])
 	end
 	PseudoTarget(settings.link.Output(settings, "pseudo_tools") .. settings.link.extension, tools)
 end
@@ -450,6 +454,7 @@ function GenerateSettings(conf, arch, builddir, compiler)
 	settings.cc.includes:Add("src")
 	settings.cc.includes:Add("src/engine/external/pnglite")
 	settings.cc.includes:Add("src/engine/external/wavpack")
+	settings.cc.includes:Add("src/engine/external/astar-jps")
 	settings.cc.includes:Add(generated_src_dir)
 	
 	if family == "windows" then

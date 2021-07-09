@@ -12,6 +12,7 @@
 #include <game/client/components/scoreboard.h>
 
 #include "controls.h"
+#include "bot.h"
 
 CControls::CControls()
 {
@@ -113,7 +114,7 @@ int CControls::SnapInput(int *pData)
 	bool Send = false;
 
 	// update player state
-	if(m_pClient->m_pChat->IsActive())
+	if(m_pClient->m_pChat->IsActive() && Config()->m_ClBot == 0)
 		m_InputData.m_PlayerFlags = PLAYERFLAG_CHATTING;
 	else
 		m_InputData.m_PlayerFlags = 0;
@@ -127,7 +128,7 @@ int CControls::SnapInput(int *pData)
 	m_LastData.m_PlayerFlags = m_InputData.m_PlayerFlags;
 
 	// we freeze the input if chat or menu is activated
-	if(m_pClient->m_pChat->IsActive() || m_pClient->m_pMenus->IsActive())
+	if((m_pClient->m_pChat->IsActive() || m_pClient->m_pMenus->IsActive()) && Config()->m_ClBot == 0)
 	{
 		OnReset();
 
@@ -139,34 +140,40 @@ int CControls::SnapInput(int *pData)
 	}
 	else
 	{
-		m_InputData.m_TargetX = (int)m_MousePos.x;
-		m_InputData.m_TargetY = (int)m_MousePos.y;
-		if(!m_InputData.m_TargetX && !m_InputData.m_TargetY)
-		{
-			m_InputData.m_TargetX = 1;
-			m_MousePos.x = 1;
-		}
+		if (Config()->m_ClBot && m_pClient->m_aClients[m_pClient->m_LocalClientID].m_Team != TEAM_SPECTATORS) {
+			m_InputData = Bot()->GetInputData(m_LastData);
+			m_MousePos.x = m_InputData.m_TargetX;
+			m_MousePos.y = m_InputData.m_TargetY;
+		} else {
+			m_InputData.m_TargetX = (int)m_MousePos.x;
+			m_InputData.m_TargetY = (int)m_MousePos.y;
+			if(!m_InputData.m_TargetX && !m_InputData.m_TargetY)
+			{
+				m_InputData.m_TargetX = 1;
+				m_MousePos.x = 1;
+			}
 
-		// set direction
-		m_InputData.m_Direction = 0;
-		if(m_InputDirectionLeft && !m_InputDirectionRight)
-			m_InputData.m_Direction = -1;
-		if(!m_InputDirectionLeft && m_InputDirectionRight)
-			m_InputData.m_Direction = 1;
+			// set direction
+			m_InputData.m_Direction = 0;
+			if(m_InputDirectionLeft && !m_InputDirectionRight)
+				m_InputData.m_Direction = -1;
+			if(!m_InputDirectionLeft && m_InputDirectionRight)
+				m_InputData.m_Direction = 1;
 
-		// stress testing
-		if(Config()->m_DbgStress)
-		{
-			float t = Client()->LocalTime();
-			mem_zero(&m_InputData, sizeof(m_InputData));
+			// stress testing
+			if(Config()->m_DbgStress)
+			{
+				float t = Client()->LocalTime();
+				mem_zero(&m_InputData, sizeof(m_InputData));
 
-			m_InputData.m_Direction = ((int)t/2)%3-1;
-			m_InputData.m_Jump = ((int)t)&1;
-			m_InputData.m_Fire = ((int)(t*10));
-			m_InputData.m_Hook = ((int)(t*2))&1;
-			m_InputData.m_WantedWeapon = ((int)t)%NUM_WEAPONS;
-			m_InputData.m_TargetX = (int)(sinf(t*3)*100.0f);
-			m_InputData.m_TargetY = (int)(cosf(t*3)*100.0f);
+				m_InputData.m_Direction = ((int)t/2)%3-1;
+				m_InputData.m_Jump = ((int)t)&1;
+				m_InputData.m_Fire = ((int)(t*10));
+				m_InputData.m_Hook = ((int)(t*2))&1;
+				m_InputData.m_WantedWeapon = ((int)t)%NUM_WEAPONS;
+				m_InputData.m_TargetX = (int)(sinf(t*3)*100.0f);
+				m_InputData.m_TargetY = (int)(cosf(t*3)*100.0f);
+			}
 		}
 
 		// check if we need to send input

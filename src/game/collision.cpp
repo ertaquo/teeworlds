@@ -12,6 +12,11 @@
 #include <game/layers.h>
 #include <game/collision.h>
 
+#include <unordered_set>
+#include <atomic>
+#include <algorithm>
+#include <execution>
+
 CCollision::CCollision()
 {
 	m_pTiles = 0;
@@ -30,6 +35,8 @@ void CCollision::Init(class CLayers *pLayers)
 	for(int i = 0; i < m_Width*m_Height; i++)
 	{
 		int Index = m_pTiles[i].m_Index;
+
+		m_pTiles[i].m_Reserved = m_pTiles[i].m_Index;
 
 		if(Index > 128)
 			continue;
@@ -89,6 +96,40 @@ int CCollision::IntersectLine(vec2 Pos0, vec2 Pos1, vec2 *pOutCollision, vec2 *p
 	if(pOutBeforeCollision)
 		*pOutBeforeCollision = Pos1;
 	return 0;
+}
+
+bool CCollision::IntersectLineFast(vec2 Pos0, vec2 Pos1) const
+{
+	const int End = distance(Pos0, Pos1)+1;
+	const float InverseEnd = 1.0f/End;
+
+	for(int i = 0; i <= End; i++)
+	{
+		vec2 Pos = mix(Pos0, Pos1, i*InverseEnd);
+		if(CheckPoint(Pos.x, Pos.y))
+		{
+			return true;
+		}
+	}
+
+	return false;
+
+	/*const int End = distance(Pos0, Pos1)+1;
+	const float InverseEnd = 1.0f/End;
+
+	std::unordered_set<int> points;
+
+    for(int i = 0; i <= End; i++) {
+		vec2 Pos = mix(Pos0, Pos1, i * InverseEnd);
+
+		int Nx = clamp(round_to_int(Pos.x) / 32, 0, m_Width - 1);
+		int Ny = clamp(round_to_int(Pos.y) / 32, 0, m_Height - 1);
+		points.insert(Ny*m_Width+Nx);
+	}
+
+	return std::any_of(std::execution::par, points.cbegin(), points.cend(), [&](const int point){
+		return m_pTiles[point].m_Index&COLFLAG_SOLID;
+	});*/
 }
 
 // TODO: OPT: rewrite this smarter!

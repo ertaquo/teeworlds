@@ -95,6 +95,7 @@ public:
 	class IEditor *Editor() { return m_pEditor; }
 	class IFriends *Friends() { return m_pFriends; }
 	class IBlacklist *Blacklist() { return m_pBlacklist; }
+	class CBot *Bot() { return m_pBot; }
 
 	const char *NetobjFailedOn() { return m_NetObjHandler.FailedObjOn(); }
 	int NetobjNumFailures() { return m_NetObjHandler.NumObjFailures(); }
@@ -339,6 +340,7 @@ public:
 	class CItems *m_pItems;
 	class CMapLayers *m_pMapLayersBackGround;
 	class CMapLayers *m_pMapLayersForeGround;
+	class CBot *m_pBot;
 };
 
 
