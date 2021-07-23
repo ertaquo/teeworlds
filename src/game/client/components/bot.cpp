@@ -11,10 +11,6 @@
 #include <engine/serverbrowser.h>
 #include <engine/storage.h>
 
-extern "C" {
-  #include <engine/external/astar-jps/AStar.h>
-}
-
 #include "bot.h"
 #include "camera.h"
 
@@ -31,7 +27,6 @@ static IGraphics::CTextureHandle gs_EmptyTexture;
 
 CBot::CBot() {
   m_pField = nullptr;
-  m_pJPSField = nullptr;
 
 	OnReset();
 }
@@ -44,10 +39,6 @@ void CBot::OnReset() {
     delete[] m_pField;
     m_pField = nullptr;
   }
-  if (m_pJPSField != nullptr) {
-    delete[] m_pJPSField;
-    m_pJPSField = nullptr;
-  }
 
   m_aEntities.clear();
 
@@ -56,7 +47,6 @@ void CBot::OnReset() {
   ResetTriangles(m_aTriangles);
   m_bTrianglesReady.store(false);
   m_PathCache.clear();
-  m_JPSCache.clear();
   m_TrianglesLock.unlock();
 
   ResetWeapons();
@@ -130,10 +120,6 @@ void CBot::LoadMapData() {
 		delete[] m_pField;
     m_pField = nullptr;
   }
-	if (m_pJPSField != nullptr) {
-		delete[] m_pJPSField;
-    m_pJPSField = nullptr;
-  }
 
 	CMapItemLayerTilemap *pTileMap = Layers()->GameLayer();
 	CTile *pTiles = (CTile *)Kernel()->RequestInterface<IMap>()->GetData(pTileMap->m_Data);
@@ -141,21 +127,17 @@ void CBot::LoadMapData() {
 	m_FieldWidth = pTileMap->m_Width;
 	m_FieldHeight = pTileMap->m_Height;
 	m_pField = new char[m_FieldWidth * m_FieldHeight];
-  m_pJPSField = new char[m_FieldWidth * m_FieldHeight];
 
 	for (int y = 0; y < pTileMap->m_Height; y++) {
 		for (int x = 0; x < pTileMap->m_Width; x++) {
 			int index = pTiles[y * pTileMap->m_Width + x].m_Reserved;
 
       m_pField[GetFieldIndex(x, y)] = 0;
-      m_pJPSField[GetFieldIndex(x, y)] = 1;
 
       if (index == TILE_SOLID) {
         m_pField[GetFieldIndex(x, y)] = 1;
-        m_pJPSField[GetFieldIndex(x, y)] = 0;
       } else if (index == TILE_NOHOOK) {
         m_pField[GetFieldIndex(x, y)] = 2;
-        m_pJPSField[GetFieldIndex(x, y)] = 0;
       } else if (index >= ENTITY_OFFSET) {
 				CBotEntity entity(ivec2(x, y), index - ENTITY_OFFSET);
 
@@ -784,51 +766,6 @@ std::list<vec2> CBot::FindPath(vec2 from, vec2 to, bool useDirect) {
 		char aBuf[256];
 		str_format(aBuf, sizeof(aBuf), "unable to find path from (x=%.0f, y=%.0f) to (x=%.0f, y=%.0f)", from.x, from.y, to.x, to.y);
 		Console()->Print(IConsole::OUTPUT_LEVEL_ADDINFO, "bot", aBuf);
-
-    // if we can't find suitable path, let's do this using A*-JPS library
-
-    int indexFrom = GetFieldIndex(
-      clamp((int)round(from.x / 32.0f), 0, m_FieldWidth - 1),
-      clamp((int)round(from.y / 32.0f), 0, m_FieldHeight - 1)
-    );
-    int indexTo = GetFieldIndex(
-      clamp((int)round(to.x / 32.0f), 0, m_FieldWidth - 1),
-      clamp((int)round(to.y / 32.0f), 0, m_FieldHeight - 1)
-    );
-
-    auto itCached = m_JPSCache.find(std::make_pair(indexFrom, indexTo));
-    if (itCached != m_JPSCache.end()) {
-      result = itCached->second;
-
-      result.push_front(from);
-      result.push_back(to);
-
-      m_TrianglesLock.unlock();
-      return result;
-    }
-
-    int solutionLength;
-    int *paSolution = astar_compute((const char *)m_pJPSField, &solutionLength, m_FieldWidth, m_FieldHeight, indexFrom, indexTo);
-    if (paSolution) {
-      result.push_back(from);
-      for (int i = 0; i < solutionLength; i++) {
-        ivec2 fieldPos = GetPositionFromIndex(paSolution[i]);
-        vec2 pos(
-          fieldPos.x * 32.0f + 16.0f,
-          fieldPos.y * 32.0f + 16.0f
-        );
-
-        result.push_back(pos);
-      }
-      result.push_back(to);
-
-      free(paSolution);
-
-      m_JPSCache[std::make_pair(indexFrom, indexTo)] = result;
-
-      m_TrianglesLock.unlock();
-      return result;
-    }
     
     m_TrianglesLock.unlock();
     result.push_back(from);

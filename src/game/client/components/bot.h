@@ -72,7 +72,6 @@ class CBot : public CComponent {
 private:
   int m_FieldWidth, m_FieldHeight;
   char *m_pField;
-  char *m_pJPSField;
 	std::list<CBotEntity> m_aEntities;
   std::list<vec2> m_aEdges;
 
@@ -81,7 +80,6 @@ private:
   std::list<CBotTriangle*> m_aTriangles;
   std::atomic<bool> m_bTrianglesReady;
   std::map<std::pair<const CBotTriangle *, const CBotTriangle *>, std::list<vec2>> m_PathCache;
-  std::map<std::pair<const int, const int>, std::list<vec2>> m_JPSCache;
 
   int m_aWeapons[NUM_WEAPONS];
   int m_WeaponPickup;

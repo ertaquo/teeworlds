@@ -488,16 +488,12 @@ add_library(json EXCLUDE_FROM_ALL OBJECT ${DEP_JSON_SRC})
 set_src(DEP_MD5_SRC GLOB src/engine/external/md5 md5.c md5.h)
 add_library(md5 EXCLUDE_FROM_ALL OBJECT ${DEP_MD5_SRC})
 
-set_src(DEP_ASTAR_JPS_SRC GLOB src/engine/external/astar-jps AStar.c AStar.h IndexPriorityQueue.c IndexPriorityQueue.h)
-add_library(astarjps EXCLUDE_FROM_ALL OBJECT ${DEP_ASTAR_JPS_SRC})
-
-list(APPEND TARGETS_DEP json md5 astarjps)
+list(APPEND TARGETS_DEP json md5)
 set(DEP_JSON $<TARGET_OBJECTS:json>)
 set(DEP_MD5)
 if(NOT CRYPTO_FOUND)
   set(DEP_MD5 $<TARGET_OBJECTS:md5>)
 endif()
-set(DEP_ASTAR_JPS $<TARGET_OBJECTS:astarjps>)
 
 ########################################################################
 # DATA
@@ -1388,7 +1384,7 @@ set(GAME_GENERATED_SHARED
   src/generated/protocol.h
 )
 
-set(DEPS ${DEP_JSON} ${DEP_MD5} ${ZLIB_DEP} ${DEP_ASTAR_JPS})
+set(DEPS ${DEP_JSON} ${DEP_MD5} ${ZLIB_DEP})
 
 # Libraries
 set(LIBS ${CMAKE_THREAD_LIBS_INIT} ${ZLIB_LIBRARIES} ${CRYPTO_LIBRARIES} ${PLATFORM_LIBS})
